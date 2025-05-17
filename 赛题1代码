@@ -1,0 +1,339 @@
+import gc
+import joblib
+import warnings
+from autogluon.tabular import TabularPredictor
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import xgboost as xgb
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.utils.class_weight import compute_sample_weight
+import multiprocessing as mp
+import matplotlib.pyplot as plt
+warnings.filterwarnings('ignore')
+
+#从广告点击的角度考察问题，构造变量
+def build_kfold_indicator(train_df, test_df, crea_col = None, groupby_col='user_id', cat_col='category', method = 'nunique', label_col='is_click', n_splits=5, random_state=42):
+    """
+    基于 K 折，避免数据泄漏
+    """
+    train_df[crea_col] = np.nan
+    col_index = train_df.columns.get_loc(crea_col)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    #训练集处理
+    for train_idx, val_idx in skf.split(train_df, train_df['is_click']):
+        df_train = train_df.iloc[train_idx,:]
+        df_val = train_df.iloc[val_idx,:]
+        df_tmp = df_train[df_train['is_click'] == 1].groupby(groupby_col)[cat_col].agg({method}).reset_index()
+        df_tmp = df_tmp.rename(columns = {method: f'{crea_col}_val'})
+        df_val = df_val.merge(df_tmp, on = groupby_col, how = 'left')
+        train_df.iloc[val_idx, col_index] = df_val[f'{crea_col}_val'].values
+        
+    #测试集处理
+    df_tmp = train_df[train_df['is_click'] == 1].groupby(groupby_col)[cat_col].agg({method}).reset_index()
+    # train_df = train_df.merge(df_tmp, on = groupby_col, how = 'left')
+    # train_df[crea_col] = train_df[crea_col].fillna(train_df[method])
+    train_df[crea_col] = train_df[crea_col].fillna(0)
+    # train_df = train_df.drop([method], axis = 1)
+    df_tmp = df_tmp.rename(columns = {method: crea_col})
+    test_df = test_df.merge(df_tmp, on = groupby_col, how = 'left')
+    test_df[crea_col] = test_df[crea_col].fillna(0)
+    return train_df, test_df
+
+#从总量角度考察问题，构造变量
+def build_kfold_no_click_indicator(train_df, test_df, crea_col = None, groupby_col='user_id', cat_col='category', method = 'nunique', n_splits=5, random_state=42):
+    """
+    基于 K 折，避免数据泄漏
+    """
+    train_df[crea_col] = train_df.groupby(groupby_col)[cat_col].transform(method)
+    col_index = train_df.columns.get_loc(crea_col)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+   #训练集处理
+    for train_idx, val_idx in skf.split(train_df, train_df['is_click']):
+        df_train = train_df.iloc[train_idx,:]
+        df_val = train_df.iloc[val_idx,:]
+        df_tmp = df_train.groupby(groupby_col)[cat_col].agg({method}).reset_index()
+        df_tmp = df_tmp.rename(columns = {method: f'{crea_col}_val'})
+        df_val = df_val.merge(df_tmp, on = groupby_col, how = 'left')
+        train_df.iloc[val_idx, col_index] = df_val[f'{crea_col}_val'].values
+    #测试集处理
+    df_tmp = train_df.groupby(groupby_col)[cat_col].agg({method}).reset_index()
+    df_tmp = df_tmp.rename(columns = {method: crea_col})
+    test_df = test_df.merge(df_tmp, on = groupby_col, how = 'left')
+    test_df[crea_col] = test_df[crea_col].fillna(0)
+    return train_df, test_df
+
+
+#使用KFOLD生成TE编码
+def target_encode(train, test, col, target="y", kfold=5, smooth=20, agg="mean"):
+    #自定义kfold
+    train['kfold'] = ((train.index) % kfold)
+    #合并需要处理的列名
+    col_name = '_'.join(col)
+    #生成TE列名
+    train[f'TE_{agg.upper()}_' + col_name] = 0
+    #训练集交叉检验
+    for i in range(kfold):
+        #筛选训练集
+        df_tmp = train[train['kfold']!=i]
+        #计算总体分布的统计量
+        if agg=="mean": mn = train[target].mean()
+        elif agg=="std": mn = train[target].std()
+        #在训练集上按照col分组计算统计量
+        df_tmp = df_tmp[col + [target]].groupby(col, dropna = False).agg([agg, 'count']).reset_index()
+        df_tmp.columns = col + [agg, 'count']
+        #对统计量平滑处理
+        if agg=="nunique":
+            df_tmp['TE_tmp'] = df_tmp[agg] / df_tmp['count']
+        else:
+            df_tmp['TE_tmp'] = ((df_tmp[agg]*df_tmp['count'])+(mn*smooth)) / (df_tmp['count']+smooth)
+        #根据col分组情况进行合并
+        df_tmp_m = train[col + ['kfold', f'TE_{agg.upper()}_' + col_name]].merge(df_tmp, how='left', left_on=col, right_on=col)
+        #KFOLD的验证集数据，如果在train中存在分组直接使用TE_tmp填充，不存在使用总体统计量填充
+        df_tmp_m.loc[df_tmp_m['kfold']==i, f'TE_{agg.upper()}_' + col_name] = df_tmp_m.loc[df_tmp_m['kfold']==i, 'TE_tmp']
+        train[f'TE_{agg.upper()}_' + col_name] = df_tmp_m[f'TE_{agg.upper()}_' + col_name].fillna(mn).values 
+    df_tmp = train[col + [target]].groupby(col, dropna = False).agg([agg, 'count']).reset_index()
+    if agg=="mean": mn = train[target].mean()
+    elif agg=='std': mn = train[target].std()
+    df_tmp.columns = col + [agg, 'count']
+    if agg=="nunique":
+        df_tmp['TE_tmp'] = df_tmp[agg] / df_tmp['count']
+    else:
+        df_tmp['TE_tmp'] = ((df_tmp[agg]*df_tmp['count'])+(mn*smooth)) / (df_tmp['count']+smooth)
+    #使用train总体的TE统计量对验证集和测试集赋值
+    df_tmp_m = test[col].merge(df_tmp, how='left', left_on=col, right_on=col)
+    test[f'TE_{agg.upper()}_' + col_name] = df_tmp_m['TE_tmp'].fillna(mn).values
+    test[f'TE_{agg.upper()}_' + col_name] = test[f'TE_{agg.upper()}_' + col_name].astype("float32")
+    train = train.drop('kfold', axis=1)
+    train[f'TE_{agg.upper()}_' + col_name] = train[f'TE_{agg.upper()}_' + col_name].astype("float32")
+    return(train, test)
+
+#build_kfold_user_click_cat，build_kfold_user_click_material均是从点击的角度去考察问题，只是一开始只考虑了这两种情况，后续为了方便，写了通用函数build_kfold_indicator
+
+def build_kfold_user_click_cat(train_df, test_df, user_col='user_id', cat_col='category', label_col='is_click', n_splits=5, random_state=42):
+    """
+    构造 user_id 的点击广告类别数（user_click_cat），基于 K 折，避免数据泄漏
+    """
+    train_df['user_click_cat'] = np.nan
+    col_index = train_df.columns.get_loc('user_click_cat')
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    #训练集
+    for train_idx, val_idx in skf.split(train_df, train_df[label_col]):
+        df_train = train_df.iloc[train_idx,:]
+        df_val = train_df.iloc[val_idx,:]
+        df_tmp = df_train[df_train['is_click'] == 1].groupby(user_col)[cat_col].nunique().reset_index()
+        df_tmp = df_tmp.rename(columns = {cat_col: 'user_click_cat_val'})
+        df_val = df_val.merge(df_tmp, on = user_col, how = 'left')
+        train_df.iloc[val_idx, col_index] = df_val['user_click_cat_val'].values
+    #测试集
+    df_tmp = train_df[train_df['is_click'] == 1].groupby(user_col)[cat_col].nunique().reset_index()
+    df_tmp = df_tmp.rename(columns = {cat_col: 'user_click_cat'})
+    # train_df = train_df.merge(df_tmp, on = user_col, how = 'left')
+    # train_df['user_click_cat'] = train_df['user_click_cat'].fillna(train_df['user_click_cat_all'])
+    train_df['user_click_cat'] = train_df['user_click_cat'].fillna(0)
+    # train_df = train_df.drop(['user_click_cat_all'], axis = 1)
+    test_df = test_df.merge(df_tmp, on = user_col, how = 'left')
+    test_df['user_click_cat'] = test_df['user_click_cat'].fillna(0)
+    return train_df, test_df
+
+
+
+def build_kfold_user_click_material(train_df, test_df, user_col='user_id', cat_col='material_type', label_col='is_click', n_splits=5, random_state=42):
+    """
+    构造 user_id 的点击广告类别数（user_click_cat），基于 K 折，避免数据泄漏
+    """
+    train_df['user_click_material'] = np.nan
+    col_index = train_df.columns.get_loc('user_click_material')
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    #训练集
+    for train_idx, val_idx in skf.split(train_df, train_df[label_col]):
+        df_train = train_df.iloc[train_idx,:]
+        df_val = train_df.iloc[val_idx,:]
+        df_tmp = df_train[df_train['is_click'] == 1].groupby(user_col)[cat_col].nunique().reset_index()
+        df_tmp = df_tmp.rename(columns = {cat_col: 'user_click_material_val'})
+        df_val = df_val.merge(df_tmp, on = user_col, how = 'left')
+        train_df.iloc[val_idx, col_index] = df_val['user_click_material_val'].values
+    #测试集
+    df_tmp = train_df[train_df['is_click'] == 1].groupby(user_col)[cat_col].nunique().reset_index()
+    
+    df_tmp = df_tmp.rename(columns = {cat_col: 'user_click_material'})
+    # train_df = train_df.merge(df_tmp, on = user_col, how = 'left')
+    # train_df['user_click_material'] = train_df['user_click_material'].fillna(train_df['user_click_material_all'])
+    train_df['user_click_material'] = train_df['user_click_material'].fillna(0)
+    # train_df = train_df.drop(['user_click_material_all'], axis = 1)
+    test_df = test_df.merge(df_tmp, on = user_col, how = 'left')
+    test_df['user_click_material'] = test_df['user_click_material'].fillna(0)
+    return train_df, test_df
+
+
+
+
+
+
+def main():
+    #读取4个数据集
+    train_data = pd.read_csv('./data/train_dataset.csv')
+    test_data = pd.read_csv('./data/test_dataset.csv')
+    ad_feature = pd.read_csv('./data/ad_features.csv')
+    user_feature = pd.read_csv('./data/user_features.csv')
+    #数据集join
+    train = train_data.merge(ad_feature, on = 'ad_id', how = 'left')
+    train = train.merge(user_feature, on = 'user_id', how = 'left')
+    test = test_data.merge(ad_feature, on = 'ad_id', how = 'left')
+    test = test.merge(user_feature, on = 'user_id', how = 'left')
+    
+    
+    #合并train跟test方便处理
+    combined = pd.concat([train, test], axis=0, ignore_index = True)
+    combined['exposure_time'] = pd.to_datetime(combined['exposure_time'])
+    object_col = combined.select_dtypes(include = ['object']).columns
+    object_col = object_col.tolist()
+    object_col
+    for col in object_col:
+        #类别变量的Nan填充成Unknow
+        combined[col] = combined[col].fillna('Unknow')
+        combined[f'{col}_count'] = combined[col].map(combined[col].value_counts())
+        #类别少的可以替换成Other，不过本次数据集没有这样的情况
+        combined.loc[combined[f'{col}_count']<10, col] = 'Other'
+        # combined.loc[combined[f'{col}_count']<5, num_col] = np.nan
+        combined.drop([f'{col}_count'], axis = 1, inplace = True)
+        #label encode
+        combined[col],_ = combined[col].factorize()
+        combined[col] -= combined[col].min()
+    #fillna的填充，在填充以前最好设定groupby的dropna参数为False查看nan是否有额外信息在决定填充的值
+    combined['product_price'] = combined['product_price'].fillna(combined['product_price'].median())
+    combined['historical_ctr'] = combined['historical_ctr'].fillna(0.24)
+    combined['age'] = combined['age'].fillna(combined['age'].median())
+    #上述是我看了一下不同组的click点击情况，然后把nan归到了最相近的组里
+    #填充为-99是因为activity_score里没有跟nan保持相近信息的组，-99可以让他被模型识别成极端值，保证额外信息
+    combined['activity_score'] = combined['activity_score'].fillna(-99)
+    #gender在数据集中是0-1，需要自己把nan填充成2
+    combined['gender'] = combined['gender'].fillna(2)
+    combined['day'] = combined['exposure_time'].dt.day.astype("float32")
+    combined['dow'] = combined['exposure_time'].dt.dayofweek.astype("float32")#获取星期几；
+    combined['second'] = combined['exposure_time'].dt.second
+    combined['minute'] = combined['exposure_time'].dt.minute
+    combined['hour'] = combined['exposure_time'].dt.hour
+    combined["seconds"] = (combined["exposure_time"].astype("int") // 10**9).astype("float32")
+
+    #以下这些变量都是以lgb为测试模型，通过向前逐步特征选择，一个一个试出来的，可能有的业务意义不明确，但能提高预测效率
+    combined['advertiser_score_historical_ctr'] = combined['advertiser_score']*combined['historical_ctr']
+    combined['register_day_div_activity_score'] = combined['activity_score']/combined['registered_days']
+    combined['activity_score_historical_ctr'] = combined['activity_score']*combined['historical_ctr']
+    combined['register_day_activity_score'] = combined['activity_score']*combined['registered_days']
+    combined['price_div_purchase'] = combined['product_price']/(combined['purchase_history'] +1)
+    combined['activity_score_purchase_history'] = combined['activity_score']*combined['purchase_history']
+    combined['age_div_activity_score'] = combined['activity_score']/combined['age']
+    combined['register_day_div_purchase_history'] = combined['purchase_history']/combined['registered_days']
+    combined['advertiser_score_div_campaign_duration'] = combined['advertiser_score']/combined['campaign_duration']
+    combined['ad_nunique'] = combined.groupby(['user_id'])['ad_id'].transform('nunique')
+    combined['user_nunique'] = combined.groupby(['ad_id'])['user_id'].transform('nunique')
+    combined['gender'] = combined['gender'].astype('int8')
+    combined.drop('exposure_time', axis = 1, inplace = True)
+    train = combined.iloc[:len(train),:]
+    test = combined.iloc[len(train):,:].reset_index(drop=True)
+    test.drop(['is_click'], axis = 1, inplace=True)
+
+    
+    #TE编码
+    train, test = target_encode(train, test, ['gender', 'region'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['gender', 'occupation'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['gender', 'category'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['region', 'credit'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['occupation', 'marriage'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['gender', 'registered_days'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['region', 'registered_days'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['occupation', 'marriage', 'category'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['day', 'hour'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['hour', 'second'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['hour', 'minute'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['day', 'second'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+
+    train, test = target_encode(train, test, ['gender', 'purchase_history'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['ad_id', 'purchase_history'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['credit', 'purchase_history'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['category', 'user_id'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['material_type', 'user_id'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['ad_id', 'user_id'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['product_price', 'historical_ctr'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    train, test = target_encode(train, test, ['product_price', 'user_id'], target="is_click", kfold=5, smooth=10, agg= 'mean')
+    
+    
+    col_list = ['user_id', 'ad_id', 'occupation', 'region', 'device', 'category', 'material_type', 'second', 'minute','historical_ctr', 'age', 'activity_score', 'hour', ['user_id', 'category'], ['user_id', 'material_type']]
+
+    #CE编码
+    combined = pd.concat([train, test], ignore_index = True)
+    for col in col_list:
+        tmp = combined.groupby(col,dropna = False)['is_click'].count()
+        nm = f"CE_{'_'.join(col)}"; tmp.name = nm
+        train = train.merge(tmp, on=col, how="left")
+        test = test.merge(tmp, on=col, how="left")
+        train[nm] = train[nm].astype("int32")
+        test[nm] = test[nm].astype("int32")
+    #清除不需要的变量，释放内存
+    del tmp, combined, train_data, test_data, ad_feature, user_feature
+    gc.collect()
+
+    
+    train, test = build_kfold_user_click_cat(train, test, user_col='user_id', cat_col='material_type', label_col='is_click', n_splits=5, random_state=42)
+    train, test = build_kfold_user_click_material(train, test, user_col='user_id', cat_col='material_type', label_col='is_click', n_splits=5, random_state=42)
+    train, test = build_kfold_indicator(train, test, crea_col = 'user_click_ctr_std', groupby_col='user_id', cat_col='historical_ctr', method = 'std', label_col='is_click', n_splits=5, random_state=42)
+    train, test = build_kfold_indicator(train, test, crea_col = 'user_click_price_std', groupby_col='user_id', cat_col='historical_ctr', method = 'std', label_col='is_click', n_splits=5, random_state=42)
+    train, test = build_kfold_indicator(train, test, crea_col = 'user_click_adv_score_mean', groupby_col='user_id', cat_col='advertiser_score', method = 'mean', label_col='is_click', n_splits=5, random_state=42)
+
+
+    train, test = build_kfold_no_click_indicator(train, test, crea_col = 'ad_activity_score_mean', groupby_col='ad_id', cat_col='activity_score', method = 'mean', n_splits=5, random_state=42)
+    train, test = build_kfold_no_click_indicator(train, test, crea_col = 'ad_marriage_mean', groupby_col='ad_id', cat_col='marriage', method = 'mean', n_splits=5, random_state=42)
+    # train, test = build_kfold_no_click_indicator(train, test, crea_col = 'ad_gender_mean', groupby_col='ad_id', cat_col='gender', method = 'mean', n_splits=5, random_state=42)
+    train, test = build_kfold_no_click_indicator(train, test, crea_col = 'ad_register_day_mean', groupby_col='ad_id', cat_col='registered_days', method = 'mean', n_splits=5, random_state=42)
+    train, test = build_kfold_no_click_indicator(train, test, crea_col = 'material_type_activity_score_mean', groupby_col='material_type', cat_col='activity_score', method = 'mean', n_splits=5, random_state=42)
+    train, test = build_kfold_no_click_indicator(train, test, crea_col = 'material_type_marriage', groupby_col='material_type', cat_col='marriage', method = 'mean', n_splits=5, random_state=42)
+    train, test = build_kfold_indicator(train, test, crea_col = 'user_click_cat_adv_score_mean', groupby_col=['user_id', 'category'], cat_col='advertiser_score', method = 'mean', label_col='is_click', n_splits=5, random_state=42)
+    train, test = build_kfold_indicator(train, test, crea_col = 'user_click_cat_historical_ctr_mean', groupby_col=['user_id', 'category'], cat_col='historical_ctr', method = 'mean', label_col='is_click', n_splits=5, random_state=42)
+
+    train['product_price_div_advertiser_score']=train['advertiser_score']/train['product_price']
+    test['product_price_div_advertiser_score']=test['advertiser_score']/test['product_price']   
+
+    
+    FOLDS = 5
+    feature = train.drop(['is_click'], axis = 1)
+    label = train['is_click']
+    #计算不同类的权重缓解样本不平衡的问题
+    sample_weights = compute_sample_weight('balanced', train['is_click'])
+    train['sample_weight'] = sample_weights
+    #autogluon的参数可以自己问问AI，很简单
+    predictor = TabularPredictor(
+        problem_type='binary',
+        path= "./",
+        eval_metric='roc_auc',
+        label= 'is_click',
+        sample_weight='sample_weight',
+        verbosity=2
+    )
+    # predictor = TabularPredictor(
+    #     problem_type='binary',
+    #     path= "./",
+    #     eval_metric='roc_auc',
+    #     label= 'is_click',
+    #     verbosity=2
+    # )
+    predictor.fit(train_data=train, presets = 'medium_quality_faster_train', num_bag_folds = 8, time_limit=3600, num_stack_levels=1, num_cpus = 4)
+    probs = predictor.predict_proba(test)[1]
+    lb = predictor.leaderboard(silent=True)
+
+    # 只选取模型名称和验证分数（AUC）
+    auc_df = lb[['model', 'score_val']]
+
+    # 保存为 CSV
+    auc_df.to_csv("model_auc_scores.csv", index=False)
+
+
+    # 保存测试集预测
+    test_pred_df = pd.DataFrame({
+        'test_pred': probs
+    })
+    test_pred_df.to_csv('test_preds.csv', index=False)
+
+
+if __name__ == "__main__":
+    main()
