@@ -1,0 +1,271 @@
+#下面有一些不需要import，有点懒不想删了
+#代码供参考，有随机的因素，并且当时一直在试不同的模型，这个配置不一定与最优配置完全相同
+import pandas as pd
+import numpy as np
+import torch
+import copy
+import torch.nn.functional as F
+from transformers import AutoModel
+from torch.nn.functional import softmax
+from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
+from sklearn.metrics import f1_score, accuracy_score
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+from transformers import (
+    BertConfig, BertForMaskedLM, RobertaConfig, RobertaForMaskedLM, BertForSequenceClassification,
+    Trainer, TrainingArguments, DataCollatorForLanguageModeling, BertModel
+)
+from torch.nn.utils.rnn import pad_sequence
+
+
+train = pd.read_csv('train_text.csv')
+test = pd.read_csv('test_text.csv')
+
+train.drop(['新闻ID'],axis = 1, inplace = True)
+test.drop(['新闻ID'],axis = 1, inplace = True)
+
+#设定PAD，MASK，CLS对应的ID
+PAD_ID = 0
+MASK_ID = 1
+CLS_ID = 2
+#选择offset = 101主要是数据集中，最小的input_ids是104，为了留出PAD，MASK，CLS对应位置
+offset = 101
+train['input_ids'] = train['文本'].apply(lambda x: [CLS_ID] + [int(i) - offset for i in x.split(' ')])
+test['input_ids'] = test['文本'].apply(lambda x: [CLS_ID] + [int(i) - offset for i in x.split(' ')])
+
+# train、test合并用于无监督预训练
+# total_token_ids = train['input_ids']
+total_token_ids = pd.concat([train['input_ids'], test['input_ids']], ignore_index=True)
+
+# 计算 vocab size
+vocab_size = max(max(seq) for seq in total_token_ids) + 1
+
+train.rename(columns = {'标签':'label'}, inplace = True)
+train['label'] = train['label']-1
+
+#定义分类任务数据集
+class ClassificationDataset(Dataset):
+    def __init__(self, df, input_col='input_ids', label_col='label'):
+        self.df = df.reset_index(drop=True)
+        self.input_col = input_col
+        self.label_col = label_col
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        input_ids = self.df.at[idx, self.input_col]
+        label = self.df.at[idx, self.label_col]
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "label": torch.tensor(int(label), dtype=torch.long)
+        }
+#定义分类任务数据对齐器  
+class ClassificationCollator:
+    def __init__(self, pad_token_id=PAD_ID, max_length=128):
+        self.pad_token_id = pad_token_id
+        self.max_length = max_length
+
+    def __call__(self, batch):
+        input_ids = [x["input_ids"][:self.max_length] for x in batch]
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
+        attention_mask = (input_ids != self.pad_token_id).long()
+        label = torch.stack([x["label"] for x in batch])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "label": label
+        }
+
+#定义MLM任务数据集
+class CustomInputIDDataset(Dataset):
+    def __init__(self, input_ids_list):
+        self.input_ids_list = input_ids_list
+
+    def __len__(self):
+        return len(self.input_ids_list)
+
+    def __getitem__(self, idx):
+        return {"input_ids": torch.tensor(self.input_ids_list[idx], dtype=torch.long)}
+        
+#定义MLM任务数据对齐器
+class CustomMLMCollator:
+    def __init__(self, pad_token_id, mask_token_id, mlm_probability=0.15, max_length=128):
+        self.pad_token_id = pad_token_id
+        self.mask_token_id = mask_token_id
+        self.mlm_probability = mlm_probability
+        self.max_length = max_length
+
+    def __call__(self, examples):
+        input_ids = [e["input_ids"][:self.max_length] for e in examples]
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
+
+        label = input_ids.clone()
+        rand = torch.rand(input_ids.shape)
+        mask = (rand < self.mlm_probability) & (input_ids != self.pad_token_id)
+        input_ids[mask] = self.mask_token_id
+        label[~mask] = -100
+
+        return {
+            "input_ids": input_ids,
+            "labels": label,
+            "attention_mask": (input_ids != self.pad_token_id).long()
+        }
+#Roberta配置文件
+config = RobertaConfig(
+    vocab_size=vocab_size,
+    hidden_size=512,
+    num_attention_heads=8,
+    num_hidden_layers=6,
+    pad_token_id=PAD_ID,
+    bos_token_id=CLS_ID,
+    eos_token_id=PAD_ID,
+    max_position_embeddings=64
+)
+#MLM任务训练
+roberta_model = RobertaForMaskedLM(config)
+train_dataset = CustomInputIDDataset(total_token_ids.tolist())
+collator = CustomMLMCollator(
+    pad_token_id=PAD_ID,
+    mask_token_id=MASK_ID,
+    mlm_probability=0.2
+)
+training_args = TrainingArguments(
+    output_dir="./mlm__roberta_model",
+    num_train_epochs=50,  # 多训几轮
+    per_device_train_batch_size=64,  # 显存允许，可以提高
+    gradient_accumulation_steps=1,  # 如果还不够可以设置为2或4
+    save_steps=500,
+    save_total_limit=3,
+    logging_steps=100,
+    warmup_ratio=0.1,  # 热身期，防止初期发散
+    weight_decay=0.01,  # 加 L2 正则
+    learning_rate=3e-4,  # 合理学习率
+    lr_scheduler_type='cosine_with_restarts',
+    logging_dir="./logs",
+    report_to="none"
+)
+trainer = Trainer(
+    model=roberta_model,
+    args=training_args,
+    train_dataset=train_dataset,
+    data_collator=collator,
+    tokenizer=None
+)
+trainer.train()
+
+#本地保存
+pretrained_bert = trainer.model.roberta
+pretrained_bert.save_pretrained('./mlm_Roberta_backup')
+
+
+#[CLS] 定义分类模型
+class RobertaClassifier(nn.Module):
+    def __init__(self, pretrained_roberta_encoder, num_labels, class_weights=None, dropout_prob=0.1):
+        super().__init__()
+        self.roberta = pretrained_roberta_encoder
+        self.dropout = nn.Dropout(dropout_prob)
+        # self.classifier = nn.Linear(self.roberta.config.hidden_size, num_labels)
+        self.hidden_size = self.roberta.config.hidden_size
+        self.classifier = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.ReLU(), nn.Dropout(dropout_prob), nn.Linear(self.hidden_size, num_labels))
+        # self.fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        # self.relu = nn.ReLU()
+        # self.norm = nn.LayerNorm(self.hidden_size)
+        # self.out = nn.Linear(self.hidden_size, num_labels)
+        self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+        # self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, attention_mask, label=None):
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # 用 [CLS] token 的输出替代 pooler_output
+        pooled_output = outputs.last_hidden_state[:, 0]  # shape: [batch_size, hidden_dim]
+        pooled_output = self.dropout(pooled_output)
+        # residual = pooled_output
+        # x = self.fc1(pooled_output)
+        # x = self.relu(x)
+        # x = self.norm(x + residual)
+        # x = self.dropout(x)
+        # logits = self.out(x)
+
+        
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if label is not None:
+            loss = self.loss_fn(logits, label)
+
+        return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
+#设置训练过程的监控指标
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1_macro": f1_score(labels, preds, average='macro'),
+        "f1_micro": f1_score(labels, preds, average='micro'),
+        "f1_weighted": f1_score(labels, preds, average='weighted')
+    }
+#KFOLD
+training_args_cls = TrainingArguments(
+    output_dir="./cls_Roberta_model",
+    num_train_epochs=10,
+    per_device_train_batch_size=16,
+    learning_rate=1e-4,
+    load_best_model_at_end=True,
+    metric_for_best_model="f1_macro",
+    greater_is_better=True,
+    warmup_ratio=0.1,
+    lr_scheduler_type='cosine_with_restarts',
+    weight_decay=0.03,
+    logging_dir="./logs_cls_Roberta",
+    logging_steps=50,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    report_to="none",
+    max_grad_norm=1.0
+)
+test_df = test[['input_ids']]
+test_df['label'] = 1
+test_dataset = ClassificationDataset(test_df, input_col='input_ids', label_col='label')
+num_class = train['label'].nunique()
+oof_preds = np.zeros(len(train))  # 训练集 OOF 预测类别
+oof_preds_roberta = np.zeros((len(train), num_class)) # 训练集 OOF 预测概率
+test_preds = np.zeros((len(test), num_class))    # 测试集预测概率
+df = train[['input_ids', 'label']].reset_index(drop=True)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['label'])):
+    print(f"\n🟦 Fold {fold + 1}")
+    train_split = df.iloc[train_idx].reset_index(drop=True)
+    valid_split = df.iloc[val_idx].reset_index(drop=True)
+    #计算不同类别权重
+    class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(train_split['label']), y=train_split['label'])
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float)
+    roberta = AutoModel.from_pretrained('./mlm_Roberta_backup')
+    #生成继承MLM任务训练的分类模型
+    model = RobertaClassifier(roberta, num_labels=num_class, class_weights=class_weights_tensor, dropout_prob = 0.1)
+    # model = RobertaClassifier(roberta, num_labels=num_class, class_weights=class_weights_tensor, use_supcon=True, supcon_weight=0.2)
+    cls_train_dataset = ClassificationDataset(train_split, input_col='input_ids', label_col='label')
+    cls_val_dataset = ClassificationDataset(valid_split, input_col='input_ids', label_col='label')
+
+    trainer = Trainer(
+        model=model,
+        args=training_args_cls,
+        train_dataset=cls_train_dataset,
+        eval_dataset=cls_val_dataset,
+        tokenizer=None,
+        data_collator=ClassificationCollator(pad_token_id=PAD_ID),
+        compute_metrics=compute_metrics
+    )
+    #训练
+    trainer.train()
+    fold_val_probs = trainer.predict(cls_val_dataset).predictions
+    fold_test_probs = trainer.predict(test_dataset).predictions
+    oof_preds_roberta[val_idx,:] = fold_val_probs
+    pred_labels = fold_val_probs.argmax(axis=-1)
+    oof_preds[val_idx] = pred_labels
+    test_preds += fold_test_probs
