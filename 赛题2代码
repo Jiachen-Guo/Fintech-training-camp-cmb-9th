@@ -62,7 +62,7 @@ class ClassificationDataset(Dataset):
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "label": torch.tensor(int(label), dtype=torch.long)
         }
-#定义分类任务数据对齐器  
+#定义分类任务数据对齐器，每批input_ids是变长的，可以后续试试全部固定成max_length的方式
 class ClassificationCollator:
     def __init__(self, pad_token_id=PAD_ID, max_length=128):
         self.pad_token_id = pad_token_id
@@ -90,7 +90,7 @@ class CustomInputIDDataset(Dataset):
     def __getitem__(self, idx):
         return {"input_ids": torch.tensor(self.input_ids_list[idx], dtype=torch.long)}
         
-#定义MLM任务数据对齐器
+#定义MLM任务数据对齐器，每批input_ids是变长的，可以后续试试全部固定成max_length的方式
 class CustomMLMCollator:
     def __init__(self, pad_token_id, mask_token_id, mlm_probability=0.15, max_length=128):
         self.pad_token_id = pad_token_id
